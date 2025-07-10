@@ -5,57 +5,67 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
-import android.net.InetAddresses
-import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.net.*
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 
 class FlarmForwardService : Service() {
-
-    private var serviceJob: Job? = null
-    private var socket: Socket? = null
+    private val CHANNEL_ID = "flarm_service_channel"
+    private val NOTIF_ID = 101
 
     private val tcpServerIp = "127.0.0.1"
     private val tcpServerPort = 10113
-
     private val udpTargetIp = "127.0.0.1"
     private val udpTargetPort = 10112
 
-    private val altitudeLimit = 500  // You can make this configurable later
+    private var job: Job? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("FlightFilter Running")
+            .setContentText("Forwarding FLARM data...")
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .build()
+        startForeground(NOTIF_ID, notification)
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForegroundWithNotification()
+        val altitudeLimit = intent?.getIntExtra("altitudeLimit", 500) ?: 500
+        val flightFilter = intent?.getBooleanExtra("flightFilter", true) ?: true
+        val proximityAlert = intent?.getBooleanExtra("proximityAlert", false) ?: false
 
-        serviceJob = CoroutineScope(Dispatchers.IO).launch {
+        job = CoroutineScope(Dispatchers.IO).launch {
             try {
-                socket = Socket()
-                socket?.connect(InetSocketAddress(tcpServerIp, tcpServerPort), 3000)
-
-                val reader = BufferedReader(InputStreamReader(socket!!.getInputStream()))
+                val socket = Socket()
+                socket.connect(InetSocketAddress(tcpServerIp, tcpServerPort), 3000)
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                 val udpSocket = DatagramSocket()
                 val udpAddress = InetAddress.getByName(udpTargetIp)
 
-                while (isActive && socket?.isClosed == false) {
+                while (isActive) {
                     val line = reader.readLine() ?: break
-                    val relativeVertical = parseRelativeVertical(line)
+                    val relAlt = parseRelativeVertical(line)
 
-                    if (relativeVertical != null && relativeVertical in -altitudeLimit..altitudeLimit) {
-                        val sendData = line.toByteArray()
-                        val packet = DatagramPacket(sendData, sendData.size, udpAddress, udpTargetPort)
+                    if (!flightFilter || (relAlt != null && relAlt in -altitudeLimit..altitudeLimit)) {
+                        val packet = DatagramPacket(line.toByteArray(), line.length, udpAddress, udpTargetPort)
                         udpSocket.send(packet)
                     }
                 }
 
                 udpSocket.close()
+                socket.close()
             } catch (e: Exception) {
-                Log.e("FlarmService", "Error in service: ${e.message}", e)
-            } finally {
-                stopSelf()
+                Log.e("FlarmService", "Error in service", e)
             }
         }
 
@@ -63,43 +73,25 @@ class FlarmForwardService : Service() {
     }
 
     override fun onDestroy() {
+        job?.cancel()
         super.onDestroy()
-        serviceJob?.cancel()
-        try {
-            socket?.close()
-        } catch (_: Exception) {}
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun startForegroundWithNotification() {
-        val channelId = "flarm_forward_channel"
-        val channelName = "FLARM Forwarding Service"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = NotificationChannel(
-                channelId, channelName,
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(chan)
-        }
-
-        val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("FLARM Forwarding Running")
-            .setContentText("Filtering and forwarding data in background")
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .build()
-
-        startForeground(1, notification)
+    private fun createNotificationChannel() {
+        val manager = getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "FLARM Forwarding Service",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        manager.createNotificationChannel(channel)
     }
 
     private fun parseRelativeVertical(message: String): Int? {
         val clean = message.removePrefix("$").split("*")[0]
         val parts = clean.split(",")
-        return if (parts.size > 4 && parts[0] == "PFLAA") {
-            parts[4].toIntOrNull()
-        } else {
-            null
-        }
+        return if (parts.size > 4 && parts[0] == "PFLAA") parts[4].toIntOrNull() else null
     }
 }
